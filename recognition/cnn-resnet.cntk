@@ -1,0 +1,137 @@
+#command = TrainConvNet:Eval
+command = Eval
+
+makeMode = false ; traceLevel = 0 ; deviceId = "auto"
+
+rootDir = "." ; dataDir  = "$rootDir$/gtsrb" ; modelDir = "$rootDir$/models-resnet"
+
+modelPath = "$modelDir$/gtsrb.cmf"
+
+# Training action
+TrainConvNet = {
+    action = "train"
+
+    BrainScriptNetworkBuilder = {
+        imageShape = 32:32:3
+        labelDim = 43
+
+        SubSampleBN (x, depth, stride) =
+        {
+            # sub-sample and pad: [W x H x depth/2] --> [W/2 x H/2 x depth]
+            s = Splice ((MaxPoolingLayer {(1:1), stride = (stride:stride)} (x) : ConstantTensor (0, (1:1:depth/stride))), axis = 3)
+            b = BatchNormalizationLayer {spatialRank = 2, normalizationTimeConstant = 4096} (s)
+        }.b
+        ConvBN (x, depth, initValueScale, stride) =
+        {
+            c = ConvolutionalLayer {depth, (3:3), pad = true, stride = (stride:stride), bias = false,
+                                    init = "gaussian", initValueScale = initValueScale} (x)
+            b = BatchNormalizationLayer {spatialRank = 2, normalizationTimeConstant = 4096} (c)
+        }.b
+        ResNetNode (x, depth) =
+        {
+            c1 = ConvBN (x,  depth, 7.07, 1)
+            r1 = ReLU (c1)
+            c2 = ConvBN (r1, depth, 7.07, 1)
+            r  = ReLU (x + c2)
+        }.r
+        ResNetIncNode (x, depth) =
+        {
+            c1 = ConvBN (x,  depth, 7.07, 2)
+            r1 = ReLU (c1)
+            c2 = ConvBN (r1, depth, 7.07, 1)
+
+            xs = SubSampleBN (x, depth, 2)
+
+            r  = ReLU (xs + c2)
+        }.r
+        ResNetNodeStack (x, depth, L) =
+        {
+            r = if L == 0
+                then x
+                else ResNetNode (ResNetNodeStack (x, depth, L-1), depth)
+        }.r
+        model (features) =
+        {
+            d1 = 8
+            conv1 = ReLU (ConvBN (features, d1, 0.26, 1))
+            rn1   = ResNetNodeStack (conv1, d1, 3)
+
+            d2 = 16
+            rn2_1 = ResNetIncNode (rn1, d2)
+            rn2   = ResNetNodeStack (rn2_1, d2, 2)
+
+            d3 = 32
+            rn3_1 = ResNetIncNode (rn2, d3)
+            rn3   = ResNetNodeStack (rn3_1, d3, 2)
+
+            pool = AveragePoolingLayer {(8:8)} (rn3)
+
+            z = LinearLayer {labelDim, init = "gaussian", initValueScale = 0.4} (pool)
+        }.z
+
+        # inputs
+        features = Input {imageShape}
+        labels   = Input {labelDim}
+
+        # apply model to features
+        z = model (features)
+
+        # connect to system
+        ce       = CrossEntropyWithSoftmax (labels, z)
+        errs     = ErrorPrediction         (labels, z)
+
+        featureNodes    = (features)
+        labelNodes      = (labels)
+        criterionNodes  = (ce)
+        evaluationNodes = (errs)
+        outputNodes     = (z)
+    }
+
+    SGD = {
+        epochSize = 39209
+
+        maxEpochs = 100 ; minibatchSize = 128
+        learningRatesPerSample = 0.0078125*80:0.00078125*40:0.000078125
+        momentumAsTimeConstant = 1200
+        L2RegWeight = 0.0001
+    
+        firstMBsToShowResult = 10 ; numMBsToShowResult = 500
+    }
+
+    reader = {
+        verbosity = 0 ; randomize = true
+        deserializers = ({
+            type = "ImageDeserializer" ; module = "ImageReader"
+            file = "$dataDir$/train_map.txt"
+            input = {
+                features = { transforms = (
+                    #{ type = "Crop" ; cropType = "random" ; cropRatio = 0.8 ; jitterType = "uniRatio" } :
+                    { type = "Scale" ; width = 32 ; height = 32 ; channels = 3 ; interpolations = "linear" }
+                    #: { type = "Transpose" }
+                )}
+                labels = { labelDim = 43 }
+            }
+        })
+    }
+}
+
+# Eval action
+Eval = {
+    action = "eval"
+    minibatchSize = 16
+    evalNodeNames = errs
+    reader = {
+        verbosity = 0 ; randomize = true
+        deserializers = ({
+            type = "ImageDeserializer" ; module = "ImageReader"
+            file = "$dataDir$/test_map.txt"
+            input = {
+                features = { transforms = (
+                   { type = "Scale" ; width = 32 ; height = 32 ; channels = 3 ; interpolations = "linear" }
+                   #: { type = "Transpose" }
+                )}
+                labels = { labelDim = 43 }
+            }
+        })
+    }
+}
